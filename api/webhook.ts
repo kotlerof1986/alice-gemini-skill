@@ -1,120 +1,167 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 
-interface ChatHistoryItem {
+interface MessageHistory {
   role: 'user' | 'model';
   parts: [{ text: string }];
 }
 
 interface AliceRequest {
-  request?: { command?: string };
-  session?: { new?: boolean };
-  state?: { session?: { history?: ChatHistoryItem[] } };
+  request?: {
+    command?: string;
+    original_utterance?: string;
+  };
+  session?: {
+    new?: boolean;
+  };
+  state?: {
+    session?: {
+      history?: MessageHistory[];
+    };
+  };
   version: string;
 }
 
-async function runSerperSearch(query: string): Promise<string> {
+// Запрос к Serper для свежих данных
+async function searchWeb(query: string): Promise<string> {
   const apiKey = process.env.SERPER_API_KEY;
-  if (!apiKey) return 'Поиск недоступен: нет SERPER_API_KEY.';
+  if (!apiKey) return '';
 
   try {
     const res = await fetch('https://google.serper.dev/search', {
       method: 'POST',
-      headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+      headers: {
+        'X-API-KEY': apiKey,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({ q: query, gl: 'ru', hl: 'ru', num: 3 }),
     });
-    if (!res.ok) return 'Ошибка поиска.';
+
+    if (!res.ok) return '';
     const data = await res.json();
-    const snippets: string[] = [];
-    if (data.answerBox?.answer) snippets.push(data.answerBox.answer);
-    if (data.organic && Array.isArray(data.organic)) {
-      data.organic.slice(0, 3).forEach((item: any) => snippets.push(`${item.title}:${item.snippet}`));
+    const parts: string[] = [];
+
+    if (data.answerBox?.answer) parts.push(data.answerBox.answer);
+    if (data.answerBox?.snippet) parts.push(data.answerBox.snippet);
+    if (Array.isArray(data.organic)) {
+      data.organic.slice(0, 3).forEach((item: any) => {
+        if (item.snippet) parts.push(item.snippet);
+      });
     }
-    return snippets.join('\n') || 'Ничего не найдено.';
+
+    return parts.join(' ');
   } catch {
-    return 'Ошибка при поиске.';
+    return '';
   }
 }
 
-const searchTool: FunctionDeclaration = {
-  name: 'serper_search',
-  description: 'Поиск актуальной информации в интернете (новости, курсы, погода, факты).',
-  parameters: {
-    type: Type.OBJECT,
-    properties: { query: { type: Type.STRING, description: 'Поисковый запрос' } },
-    required: ['query'],
-  },
-};
+// Запрос к Gemini 1.5 Flash через стандартный REST API
+async function askGemini(history: MessageHistory[], prompt: string, searchContext = ''): Promise<string> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return 'В настройках сервера не указан ключ GEMINI_API_KEY.';
+
+  const systemPrompt =
+    'Ты голосовой помощник Алиса. Отвечай кратко, емко и по сути (1-3 простых предложения). Не используй markdown-разметку, списки, ссылки и звездочки.';
+
+  const fullPrompt = searchContext
+    ? `Вопрос пользователя: "${prompt}"\n\nАктуальные данные из поиска: "${searchContext}"\nСформулируй краткий ответ на основе этих данных.`
+    : prompt;
+
+  const contents = [
+    ...history,
+    {
+      role: 'user',
+      parts: [{ text: fullPrompt }],
+    },
+  ];
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 200,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    return `Ошибка Google API (${res.status}):${errText.slice(0, 120)}`;
+  }
+
+  const data = await res.json();
+  return (
+    data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+    'Не удалось получить ответ.'
+  );
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(200).send('Alice webhook active');
+  // Обработка проверки доступности (GET)
+  if (req.method !== 'POST') {
+    return res.status(200).send('Alice webhook active');
+  }
 
-  const body = req.body as AliceRequest;
-  const version = body?.version || '1.0';
-  const isNew = body?.session?.new ?? false;
-  const text = body?.request?.command?.trim() || '';
+  const body = (req.body || {}) as AliceRequest;
+  const version = body.version || '1.0';
+  const isNew = body.session?.new ?? false;
+  const userText = (body.request?.command || body.request?.original_utterance || '').trim();
 
-  if (isNew || !text) {
+  // Начало диалога
+  if (isNew || !userText) {
     return res.status(200).json({
-      response: { text: 'Здравствуйте! Я готова помочь. О чём хотите узнать?', end_session: false },
+      response: {
+        text: 'Здравствуйте! Я готова помочь. О чём хотите узнать?',
+        end_session: false,
+      },
       session_state: { history: [] },
       version,
     });
   }
 
-  const history = (body?.state?.session?.history || []).slice(-6);
-  const geminiKey = process.env.GEMINI_API_KEY;
-
-  if (!geminiKey) {
-    return res.status(200).json({
-      response: { text: 'В Vercel не задан GEMINI_API_KEY.', end_session: false },
-      session_state: { history },
-      version,
-    });
-  }
+  const history = (body.state?.session?.history || []).slice(-6);
 
   try {
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-    const contents = [...history, { role: 'user' as const, parts: [{ text }] }];
-    const systemInstruction = 'Ты голосовой помощник Алиса. Отвечай кратко (1-3 простых предложения), без звездочек, списков и markdown. Для свежих данных используй serper_search.';
+    // Если вопрос требует свежих фактов (новости, курсы, погода) — делаем быстрый поиск
+    const needsSearch = /(новост|курс|погод|сегодня|сейчас|кто победил|счет|доллар|евро)/i.test(userText);
+    let searchData = '';
 
-    const initial = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents,
-      config: { systemInstruction, tools: [{ functionDeclarations: [searchTool] }] },
-    });
-
-    const call = initial.candidates?.[0]?.content?.parts?.find((p) => p.functionCall)?.functionCall;
-    let answer = '';
-
-    if (call) {
-      const searchRes = await runSerperSearch((call.args as any).query);
-      const second = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [
-          ...contents,
-          initial.candidates![0].content,
-          { role: 'user' as const, parts: [{ functionResponse: { name: call.name, response: { result: searchRes } } }] },
-        ],
-        config: { systemInstruction },
-      });
-      answer = second.text || 'Не удалось найти ответ.';
-    } else {
-      answer = initial.text || 'Не удалось сформировать ответ.';
+    if (needsSearch) {
+      searchData = await searchWeb(userText);
     }
 
-    const cleanAnswer = answer.replace(/[*#_`\[\]()]/g, '').trim();
+    let answer = await askGemini(history, userText, searchData);
+
+    // Удаляем markdown-символы для чистого голоса
+    answer = answer.replace(/[*#_`\[\]()]/g, '').trim();
+
+    const updatedHistory: MessageHistory[] = [
+      ...history,
+      { role: 'user', parts: [{ text: userText }] },
+      { role: 'model', parts: [{ text: answer }] },
+    ].slice(-6);
 
     return res.status(200).json({
-      response: { text: cleanAnswer, end_session: false },
+      response: {
+        text: answer,
+        end_session: false,
+      },
       session_state: {
-        history: [...history, { role: 'user', parts: [{ text }] }, { role: 'model', parts: [{ text: cleanAnswer }] }].slice(-6),
+        history: updatedHistory,
       },
       version,
     });
-  } catch {
+  } catch (error: any) {
     return res.status(200).json({
-      response: { text: 'Произошла ошибка при ответе.', end_session: false },
+      response: {
+        text: `Ошибка сервера: ${String(error?.message || error).slice(0, 100)}`,
+        end_session: false,
+      },
       session_state: { history },
       version,
     });
