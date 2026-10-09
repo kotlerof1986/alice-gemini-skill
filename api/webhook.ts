@@ -12,10 +12,28 @@ interface AliceRequest {
   version: string;
 }
 
+// Получаем точный список моделей вашего аккаунта
+async function findAvailableModel(apiKey: string): Promise<string> {
+  const versions = ['v1beta', 'v1'];
+  for (const ver of versions) {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${apiKey}`);
+      if (res.ok) {
+        const data = await res.json();
+        const models: Array<{ name: string; supportedGenerationMethods?: string[] }> = data.models || [];
+        const valid = models.find(m => m.supportedGenerationMethods?.includes('generateContent'));
+        if (valid) {
+          return `${ver}/${valid.name}`;
+        }
+      }
+    } catch {}
+  }
+  return 'v1beta/models/gemini-1.5-flash';
+}
+
 async function searchSerper(query: string): Promise<string> {
   const serperKey = process.env.SERPER_API_KEY;
   if (!serperKey) return '';
-
   try {
     const res = await fetch('https://google.serper.dev/search', {
       method: 'POST',
@@ -26,8 +44,7 @@ async function searchSerper(query: string): Promise<string> {
     const data = await res.json();
     const parts: string[] = [];
     if (data.answerBox?.answer) parts.push(data.answerBox.answer);
-    if (data.answerBox?.snippet) parts.push(data.answerBox.snippet);
-    if (Array.isArray(data.organic)) {
+    if (data.organic && Array.isArray(data.organic)) {
       data.organic.slice(0, 3).forEach((item: any) => {
         if (item.snippet) parts.push(item.snippet);
       });
@@ -39,9 +56,7 @@ async function searchSerper(query: string): Promise<string> {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(200).send('Alice webhook active');
-  }
+  if (req.method !== 'POST') return res.status(200).send('Alice webhook active');
 
   const body = (req.body || {}) as AliceRequest;
   const version = body.version || '1.0';
@@ -64,36 +79,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!geminiKey) {
     return res.status(200).json({
-      response: {
-        text: 'Ошибка: GEMINI_API_KEY не задан в переменных Vercel.',
-        end_session: false,
-      },
+      response: { text: 'GEMINI_API_KEY не задан в Vercel.', end_session: false },
       session_state: { history },
       version,
     });
   }
 
   try {
-    const needsSearch = /(новост|курс|погод|сегодня|сейчас|кто победил|доллар|евро|актуальн)/i.test(userText);
+    const needsSearch = /(новост|курс|погод|сегодня|сейчас|кто победил|доллар|евро)/i.test(userText);
     let searchContext = '';
     if (needsSearch) {
       searchContext = await searchSerper(userText);
     }
 
     const promptText = searchContext
-      ? `Пользователь спросил: "${userText}".\nДанные поиска: "${searchContext}". Сформулируй краткий ответ.`
+      ? `Пользователь спросил: "${userText}". Сведения из сети: "${searchContext}". Ответь кратко.`
       : userText;
 
-    const contents = [
-      ...history,
-      {
-        role: 'user',
-        parts: [{ text: promptText }],
-      },
-    ];
+    const contents = [...history, { role: 'user', parts: [{ text: promptText }] }];
 
-    // Стабильный официальный v1 эндпоинт Google
-    const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${geminiKey}`;
+    // Находим работающую модель конкретно для вашего ключа
+    const modelTarget = await findAvailableModel(geminiKey);
+    const url = `https://generativelanguage.googleapis.com/${modelTarget}:generateContent?key=${geminiKey}`;
 
     const apiRes = await fetch(url, {
       method: 'POST',
@@ -101,7 +108,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       body: JSON.stringify({
         contents,
         systemInstruction: {
-          parts: [{ text: 'Ты голосовой ассистент Яндекс Алисы. Отвечай кратко, емко, без markdown, звездочек и списков (1-2 предложения).' }],
+          parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай кратко, емко, без звездочек и markdown (1-2 предложения).' }],
         },
       }),
     });
@@ -109,10 +116,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!apiRes.ok) {
       const errText = await apiRes.text();
       return res.status(200).json({
-        response: {
-          text: `Google API ${apiRes.status}:${errText.slice(0, 150)}`,
-          end_session: false,
-        },
+        response: { text: `Ошибка модели (${modelTarget}):${errText.slice(0, 100)}`, end_session: false },
         session_state: { history },
         version,
       });
@@ -122,26 +126,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const rawAnswer = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Не удалось сформировать ответ.';
     const cleanAnswer = rawAnswer.replace(/[*#_`\[\]()]/g, '').trim();
 
-    const updatedHistory: MessageHistory = [
-      ...history,
-      { role: 'user', parts: [{ text: userText }] },
-      { role: 'model', parts: [{ text: cleanAnswer }] },
-    ].slice(-6);
-
     return res.status(200).json({
-      response: {
-        text: cleanAnswer,
-        end_session: false,
+      response: { text: cleanAnswer, end_session: false },
+      session_state: {
+        history: [...history, { role: 'user', parts: [{ text: userText }] }, { role: 'model', parts: [{ text: cleanAnswer }] }].slice(-6),
       },
-      session_state: { history: updatedHistory },
       version,
     });
   } catch (err: any) {
     return res.status(200).json({
-      response: {
-        text: `Ошибка сервера: ${String(err?.message || err).slice(0, 120)}`,
-        end_session: false,
-      },
+      response: { text: `Ошибка: ${String(err?.message || err).slice(0, 100)}`, end_session: false },
       session_state: { history },
       version,
     });
