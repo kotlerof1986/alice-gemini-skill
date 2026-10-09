@@ -1,0 +1,11 @@
+{
+  "name": "alice-gemini-skill",
+  "version": "1.0.0",
+  "dependencies": {
+    "@google/genai": "^0.1.2"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}
