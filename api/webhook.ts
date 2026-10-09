@@ -12,10 +12,9 @@ interface AliceRequest {
   version: string;
 }
 
-// Быстрый поиск Serper с ограничением ожидания 1.5 секунды
 async function quickSearch(query: string, apiKey: string): Promise<string> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 1500);
+  const timeoutId = setTimeout(() => controller.abort(), 1200);
 
   try {
     const res = await fetch('https://google.serper.dev/search', {
@@ -30,10 +29,7 @@ async function quickSearch(query: string, apiKey: string): Promise<string> {
     const data = await res.json();
     const parts: string[] = [];
     if (data.answerBox?.answer) parts.push(data.answerBox.answer);
-    if (data.answerBox?.snippet) parts.push(data.answerBox.snippet);
-    if (Array.isArray(data.organic) && data.organic[0]?.snippet) {
-      parts.push(data.organic[0].snippet);
-    }
+    if (data.organic && data.organic[0]?.snippet) parts.push(data.organic[0].snippet);
     return parts.join(' ');
   } catch {
     clearTimeout(timeoutId);
@@ -41,51 +37,33 @@ async function quickSearch(query: string, apiKey: string): Promise<string> {
   }
 }
 
-// Прямой быстрый вызов Gemini с ограничением ожидания 2.8 секунды
 async function callGemini(contents: any[], apiKey: string): Promise<string> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2800);
+  // Список рабочих моделей для проверки в v1beta
+  const model = 'gemini-1.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  // Используем легковесную и самую быструю модель 1.5-flash-8b или 1.5-flash
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key=${apiKey}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents,
+      generationConfig: {
+        maxOutputTokens: 100,
+        temperature: 0.5,
+      },
+      systemInstruction: {
+        parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай коротко (1-2 предложения), без списков и звездочек.' }],
+      },
+    }),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents,
-        generationConfig: {
-          maxOutputTokens: 100,
-          temperature: 0.6,
-        },
-        systemInstruction: {
-          parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай очень кратко (1-2 предложения), без списков и markdown.' }],
-        },
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-
-    if (!res.ok) {
-      // Запасная попытка со стандартным gemini-1.5-flash
-      const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-      const fallbackRes = await fetch(fallbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 100 } }),
-      });
-      if (!fallbackRes.ok) return 'Не удалось получить быстрый ответ.';
-      const fallbackData = await fallbackRes.json();
-      return fallbackData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    }
-
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  } catch {
-    clearTimeout(timeoutId);
-    return 'Извините, ответ занял слишком много времени.';
+  if (!res.ok) {
+    const errorText = await res.text();
+    return `Статус ${res.status}:${errorText.slice(0, 160)}`;
   }
+
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Пустой ответ модели.';
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -113,7 +91,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!geminiKey) {
     return res.status(200).json({
-      response: { text: 'Ключ GEMINI_API_KEY не настроен в Vercel.', end_session: false },
+      response: { text: 'Ключ GEMINI_API_KEY не задан в Vercel.', end_session: false },
       session_state: { history },
       version,
     });
@@ -128,7 +106,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const promptText = searchData
-      ? `Вопрос: "${userText}". Данные: "${searchData}". Ответь в 1 предложение.`
+      ? `Вопрос: "${userText}". Справка из поиска: "${searchData}". Ответь кратко.`
       : userText;
 
     const contents = [
@@ -137,7 +115,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ];
 
     const rawAnswer = await callGemini(contents, geminiKey);
-    const cleanAnswer = rawAnswer.replace(/[*#_`\[\]()]/g, '').trim() || 'Ответ не сформирован.';
+    const cleanAnswer = rawAnswer.replace(/[*#_`\[\]()]/g, '').trim();
 
     return res.status(200).json({
       response: {
@@ -153,9 +131,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       version,
     });
-  } catch {
+  } catch (err: any) {
     return res.status(200).json({
-      response: { text: 'Сервер временно не отвечает. Попробуйте еще раз.', end_session: false },
+      response: { text: `Ошибка: ${String(err?.message || err).slice(0, 100)}`, end_session: false },
       session_state: { history },
       version,
     });
