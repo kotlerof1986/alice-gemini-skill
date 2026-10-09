@@ -12,25 +12,6 @@ interface AliceRequest {
   version: string;
 }
 
-// Получаем точный список моделей вашего аккаунта
-async function findAvailableModel(apiKey: string): Promise<string> {
-  const versions = ['v1beta', 'v1'];
-  for (const ver of versions) {
-    try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${apiKey}`);
-      if (res.ok) {
-        const data = await res.json();
-        const models: Array<{ name: string; supportedGenerationMethods?: string[] }> = data.models || [];
-        const valid = models.find(m => m.supportedGenerationMethods?.includes('generateContent'));
-        if (valid) {
-          return `${ver}/${valid.name}`;
-        }
-      }
-    } catch {}
-  }
-  return 'v1beta/models/gemini-1.5-flash';
-}
-
 async function searchSerper(query: string): Promise<string> {
   const serperKey = process.env.SERPER_API_KEY;
   if (!serperKey) return '';
@@ -98,33 +79,59 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const contents = [...history, { role: 'user', parts: [{ text: promptText }] }];
 
-    // Находим работающую модель конкретно для вашего ключа
-    const modelTarget = await findAvailableModel(geminiKey);
-    const url = `https://generativelanguage.googleapis.com/${modelTarget}:generateContent?key=${geminiKey}`;
+    // Получаем все доступные модели и пробуем по очереди живые
+    const listRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey}`);
+    let candidatesList: string[] = [];
 
-    const apiRes = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents,
-        systemInstruction: {
-          parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай кратко, емко, без звездочек и markdown (1-2 предложения).' }],
-        },
-      }),
-    });
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      const allModels: Array<{ name: string; supportedGenerationMethods?: string[] }> = listData.models || [];
+      candidatesList = allModels
+        .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+        .map((m) => m.name.replace(/^models\//, ''))
+        // Исключаем устаревшую модель, на которую ругался Google
+        .filter((name) => name !== 'gemini-2.5-flash');
+    }
 
-    if (!apiRes.ok) {
-      const errText = await apiRes.text();
+    if (candidatesList.length === 0) {
+      candidatesList = ['gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'];
+    }
+
+    let modelText = '';
+    let lastError = '';
+
+    // Пробуем модели по очереди, пока первая не вернёт успешный ответ
+    for (const model of candidatesList) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+      const apiRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents,
+          systemInstruction: {
+            parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай кратко, емко, без звездочек и markdown (1-2 предложения).' }],
+          },
+        }),
+      });
+
+      if (apiRes.ok) {
+        const data = await apiRes.json();
+        modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (modelText) break;
+      } else {
+        lastError = `${model}:${apiRes.status}`;
+      }
+    }
+
+    if (!modelText) {
       return res.status(200).json({
-        response: { text: `Ошибка модели (${modelTarget}):${errText.slice(0, 100)}`, end_session: false },
+        response: { text: `Не удалось подобрать активную модель (${lastError}).`, end_session: false },
         session_state: { history },
         version,
       });
     }
 
-    const data = await apiRes.json();
-    const rawAnswer = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Не удалось сформировать ответ.';
-    const cleanAnswer = rawAnswer.replace(/[*#_`\[\]()]/g, '').trim();
+    const cleanAnswer = modelText.replace(/[*#_`\[\]()]/g, '').trim();
 
     return res.status(200).json({
       response: { text: cleanAnswer, end_session: false },
