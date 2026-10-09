@@ -2,7 +2,7 @@
   "name": "alice-gemini-skill",
   "version": "1.0.0",
   "dependencies": {
-    "@google/genai": "^0.1.2"
+    "@google/genai": "latest"
   },
   "devDependencies": {
     "@vercel/node": "^3.0.0",
