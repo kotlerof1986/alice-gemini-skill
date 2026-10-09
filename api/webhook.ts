@@ -58,7 +58,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     ];
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-latest:generateContent?key=${geminiKey}`;
 
     const apiResponse = await fetch(url, {
       method: 'POST',
