@@ -12,27 +12,79 @@ interface AliceRequest {
   version: string;
 }
 
-async function searchSerper(query: string): Promise<string> {
-  const serperKey = process.env.SERPER_API_KEY;
-  if (!serperKey) return '';
+// Быстрый поиск Serper с ограничением ожидания 1.5 секунды
+async function quickSearch(query: string, apiKey: string): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 1500);
+
   try {
     const res = await fetch('https://google.serper.dev/search', {
       method: 'POST',
-      headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: query, gl: 'ru', hl: 'ru', num: 3 }),
+      headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: query, gl: 'ru', hl: 'ru', num: 2 }),
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
+
     if (!res.ok) return '';
     const data = await res.json();
     const parts: string[] = [];
     if (data.answerBox?.answer) parts.push(data.answerBox.answer);
-    if (data.organic && Array.isArray(data.organic)) {
-      data.organic.slice(0, 3).forEach((item: any) => {
-        if (item.snippet) parts.push(item.snippet);
-      });
+    if (data.answerBox?.snippet) parts.push(data.answerBox.snippet);
+    if (Array.isArray(data.organic) && data.organic[0]?.snippet) {
+      parts.push(data.organic[0].snippet);
     }
     return parts.join(' ');
   } catch {
+    clearTimeout(timeoutId);
     return '';
+  }
+}
+
+// Прямой быстрый вызов Gemini с ограничением ожидания 2.8 секунды
+async function callGemini(contents: any[], apiKey: string): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2800);
+
+  // Используем легковесную и самую быструю модель 1.5-flash-8b или 1.5-flash
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key=${apiKey}`;
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        generationConfig: {
+          maxOutputTokens: 100,
+          temperature: 0.6,
+        },
+        systemInstruction: {
+          parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай очень кратко (1-2 предложения), без списков и markdown.' }],
+        },
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      // Запасная попытка со стандартным gemini-1.5-flash
+      const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+      const fallbackRes = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 100 } }),
+      });
+      if (!fallbackRes.ok) return 'Не удалось получить быстрый ответ.';
+      const fallbackData = await fallbackRes.json();
+      return fallbackData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    }
+
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  } catch {
+    clearTimeout(timeoutId);
+    return 'Извините, ответ занял слишком много времени.';
   }
 }
 
@@ -55,94 +107,55 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  const history = (body.state?.session?.history || []).slice(-6);
+  const history = (body.state?.session?.history || []).slice(-4);
   const geminiKey = process.env.GEMINI_API_KEY;
+  const serperKey = process.env.SERPER_API_KEY;
 
   if (!geminiKey) {
     return res.status(200).json({
-      response: { text: 'GEMINI_API_KEY не задан в Vercel.', end_session: false },
+      response: { text: 'Ключ GEMINI_API_KEY не настроен в Vercel.', end_session: false },
       session_state: { history },
       version,
     });
   }
 
   try {
-    const needsSearch = /(новост|курс|погод|сегодня|сейчас|кто победил|доллар|евро)/i.test(userText);
-    let searchContext = '';
-    if (needsSearch) {
-      searchContext = await searchSerper(userText);
+    let searchData = '';
+    const needsSearch = /(новости|курс|погода|сегодня|сейчас|доллар|евро)/i.test(userText);
+
+    if (needsSearch && serperKey) {
+      searchData = await quickSearch(userText, serperKey);
     }
 
-    const promptText = searchContext
-      ? `Пользователь спросил: "${userText}". Сведения из сети: "${searchContext}". Ответь кратко.`
+    const promptText = searchData
+      ? `Вопрос: "${userText}". Данные: "${searchData}". Ответь в 1 предложение.`
       : userText;
 
-    const contents = [...history, { role: 'user', parts: [{ text: promptText }] }];
+    const contents = [
+      ...history,
+      { role: 'user', parts: [{ text: promptText }] },
+    ];
 
-    // Получаем все доступные модели и пробуем по очереди живые
-    const listRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${geminiKey}`);
-    let candidatesList: string[] = [];
-
-    if (listRes.ok) {
-      const listData = await listRes.json();
-      const allModels: Array<{ name: string; supportedGenerationMethods?: string[] }> = listData.models || [];
-      candidatesList = allModels
-        .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
-        .map((m) => m.name.replace(/^models\//, ''))
-        // Исключаем устаревшую модель, на которую ругался Google
-        .filter((name) => name !== 'gemini-2.5-flash');
-    }
-
-    if (candidatesList.length === 0) {
-      candidatesList = ['gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'];
-    }
-
-    let modelText = '';
-    let lastError = '';
-
-    // Пробуем модели по очереди, пока первая не вернёт успешный ответ
-    for (const model of candidatesList) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-      const apiRes = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          systemInstruction: {
-            parts: [{ text: 'Ты голосовой ассистент Алиса. Отвечай кратко, емко, без звездочек и markdown (1-2 предложения).' }],
-          },
-        }),
-      });
-
-      if (apiRes.ok) {
-        const data = await apiRes.json();
-        modelText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (modelText) break;
-      } else {
-        lastError = `${model}:${apiRes.status}`;
-      }
-    }
-
-    if (!modelText) {
-      return res.status(200).json({
-        response: { text: `Не удалось подобрать активную модель (${lastError}).`, end_session: false },
-        session_state: { history },
-        version,
-      });
-    }
-
-    const cleanAnswer = modelText.replace(/[*#_`\[\]()]/g, '').trim();
+    const rawAnswer = await callGemini(contents, geminiKey);
+    const cleanAnswer = rawAnswer.replace(/[*#_`\[\]()]/g, '').trim() || 'Ответ не сформирован.';
 
     return res.status(200).json({
-      response: { text: cleanAnswer, end_session: false },
+      response: {
+        text: cleanAnswer,
+        end_session: false,
+      },
       session_state: {
-        history: [...history, { role: 'user', parts: [{ text: userText }] }, { role: 'model', parts: [{ text: cleanAnswer }] }].slice(-6),
+        history: [
+          ...history,
+          { role: 'user', parts: [{ text: userText }] },
+          { role: 'model', parts: [{ text: cleanAnswer }] },
+        ].slice(-4),
       },
       version,
     });
-  } catch (err: any) {
+  } catch {
     return res.status(200).json({
-      response: { text: `Ошибка: ${String(err?.message || err).slice(0, 100)}`, end_session: false },
+      response: { text: 'Сервер временно не отвечает. Попробуйте еще раз.', end_session: false },
       session_state: { history },
       version,
     });
